@@ -1,45 +1,131 @@
 import streamlit as st
-from datetime import datetime
-import matplotlib.pyplot as plt
+import cv2
+import mediapipe as mp
+import numpy as np
+from PIL import Image
+import tempfile
 
-# Simulated S&P 500 total return multipliers (2000–2023)
-# These include dividend reinvestment, approximate values
-sp500_total_return_multipliers = {
-    2000: 7.54, 2001: 6.94, 2002: 6.46, 2003: 5.28, 2004: 4.82,
-    2005: 4.42, 2006: 3.92, 2007: 3.44, 2008: 2.26, 2009: 3.47,
-    2010: 3.02, 2011: 2.73, 2012: 2.35, 2013: 1.98, 2014: 1.80,
-    2015: 1.63, 2016: 1.47, 2017: 1.31, 2018: 1.21, 2019: 1.12,
-    2020: 1.00, 2021: 0.90, 2022: 0.80, 2023: 0.75
+# === Config ===
+st.set_page_config(page_title="Mobile Pose Analyzer", layout="centered")
+
+# === Style ===
+st.markdown("""
+<style>
+.block-container {
+    max-width: 480px;
+    margin: auto;
 }
+.phone-frame {
+    width: 360px;
+    height: 640px;
+    margin: auto;
+    border: 16px solid black;
+    border-radius: 36px;
+    background-color: #000;
+    box-shadow: 0 0 0 8px #888;
+    overflow: hidden;
+}
+.phone-screen {
+    width: 100%;
+    height: 100%;
+    background-color: white;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+</style>
+""", unsafe_allow_html=True)
 
-# Streamlit UI
-st.set_page_config(page_title="What If I Invested?", layout="centered")
-st.title("📈 What If I Invested in the S&P 500?")
-st.caption("See how much your investment would be worth today.")
+st.title("📱 Mobile Pose Analysis")
+st.markdown("Capture a photo and get pose feedback. Optionally compare to a reference pose.")
 
-# Inputs
-amount = st.number_input("💵 Amount Invested ($)", min_value=100, value=1000, step=100)
-year = st.selectbox("📅 Year of Investment", sorted(sp500_total_return_multipliers.keys()))
-show_chart = st.checkbox("📊 Show Growth Chart", value=True)
+# === MediaPipe Setup ===
+mp_pose = mp.solutions.pose
+pose = mp_pose.Pose(static_image_mode=True, model_complexity=1)
+mp_drawing = mp.solutions.drawing_utils
 
-# Calculation
-today = datetime.now().year
-if year in sp500_total_return_multipliers:
-    multiplier = sp500_total_return_multipliers[year]
-    current_value = round(amount * multiplier, 2)
-    st.subheader(f"💰 Your investment would be worth: **${current_value:,.2f}**")
-    st.caption(f"Based on an approximate total return multiplier of {multiplier} since {year}.")
+# === Helper Functions ===
+def calculate_angle(a, b, c):
+    a, b, c = np.array(a), np.array(b), np.array(c)
+    ba, bc = a - b, c - b
+    cosine = np.dot(ba, bc) / (np.linalg.norm(ba) * np.linalg.norm(bc) + 1e-6)
+    return np.degrees(np.arccos(np.clip(cosine, -1.0, 1.0)))
 
-    # Chart
-    if show_chart:
-        years = list(range(year, today + 1))
-        values = [amount * (multiplier * ((i - year + 1)/len(years))) for i in years]
-        fig, ax = plt.subplots()
-        ax.plot(years, values, marker='o')
-        ax.set_title("Investment Growth Over Time")
-        ax.set_xlabel("Year")
-        ax.set_ylabel("Value ($)")
-        st.pyplot(fig)
-else:
-    st.warning("Data not available for that year.")
+def extract_angles(landmarks):
+    indices = mp_pose.PoseLandmark
+    try:
+        return [
+            calculate_angle(landmarks[indices.LEFT_SHOULDER.value],
+                            landmarks[indices.LEFT_ELBOW.value],
+                            landmarks[indices.LEFT_WRIST.value]),
+            calculate_angle(landmarks[indices.RIGHT_SHOULDER.value],
+                            landmarks[indices.RIGHT_ELBOW.value],
+                            landmarks[indices.RIGHT_WRIST.value]),
+            calculate_angle(landmarks[indices.LEFT_HIP.value],
+                            landmarks[indices.LEFT_KNEE.value],
+                            landmarks[indices.LEFT_ANKLE.value]),
+            calculate_angle(landmarks[indices.RIGHT_HIP.value],
+                            landmarks[indices.RIGHT_KNEE.value],
+                            landmarks[indices.RIGHT_ANKLE.value])
+        ]
+    except:
+        return None
 
+def weighted_distance(a1, a2):
+    weights = np.array([0.4, 0.4, 0.1, 0.1])
+    diff = np.array(a1) - np.array(a2)
+    return np.sqrt(np.sum((diff ** 2) * weights))
+
+def feedback_label(score, threshold=20):
+    if score < threshold:
+        return "✅ Good", (0, 255, 0)
+    elif score < threshold * 2:
+        return "⚠️ Okay", (0, 255, 255)
+    else:
+        return "❌ Poor", (255, 0, 0)
+
+# === Reference Pose ===
+ref_angles = None
+ref_img = st.file_uploader("Upload a reference pose image (optional)", type=["jpg", "jpeg", "png"])
+if ref_img:
+    img = Image.open(ref_img).convert("RGB")
+    frame = np.array(img)
+    result = pose.process(frame)
+    if result.pose_landmarks:
+        lm = [(l.x, l.y, l.z) for l in result.pose_landmarks.landmark]
+        ref_angles = extract_angles(lm)
+        st.image(img, caption="Reference Pose", use_column_width=True)
+
+# === Camera Input (Mobile-Compatible) ===
+img_file = st.camera_input("Capture a pose photo")
+
+if img_file:
+    # Convert to OpenCV image
+    img = Image.open(img_file).convert("RGB")
+    frame = np.array(img)
+    result = pose.process(frame)
+
+    if result.pose_landmarks:
+        mp_drawing.draw_landmarks(frame, result.pose_landmarks, mp_pose.POSE_CONNECTIONS)
+        lm = [(l.x, l.y, l.z) for l in result.pose_landmarks.landmark]
+        angles = extract_angles(lm)
+
+        if angles:
+            if ref_angles:
+                score = weighted_distance(angles, ref_angles)
+            else:
+                score = np.std(angles)  # fallback scoring
+
+            label, color = feedback_label(score)
+            cv2.putText(frame, f"{label} | Score: {score:.1f}", (10, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1, color, 2)
+        else:
+            cv2.putText(frame, "Pose not complete", (10, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 0), 2)
+
+        # Display inside phone frame
+        st.markdown('<div class="phone-frame"><div class="phone-screen">', unsafe_allow_html=True)
+        st.image(frame, channels="RGB", use_column_width=True)
+        st.markdown('</div></div>', unsafe_allow_html=True)
+    else:
+        st.warning("No pose detected. Try a clearer image.")
